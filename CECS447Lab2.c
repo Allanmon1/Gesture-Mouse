@@ -53,6 +53,37 @@
 #define RED       0x02
 #define BLUE      0x04
 #define GREEN     0x08
+
+#define BNO055_ID 0xA0
+#define BNO055_CHIP_ID_ADDR  0x00
+#define BNO055_ACCEL_REV_ID_ADDR  0x01
+#define BNO055_GYRO_REV_ID_ADDR  0x03
+
+#define BNO055_ACCEL_DATA_X_LSB_ADDR 0x08
+#define BNO055_ACCEL_DATA_X_MSB_ADDR 0x09
+#define BNO055_ACCEL_DATA_Y_LSB_ADDR 0x0A
+#define BNO055_ACCEL_DATA_Y_MSB_ADDR 0x0B
+#define BNO055_ACCEL_DATA_Z_LSB_ADDR 0x0C
+#define BNO055_ACCEL_DATA_Z_MSB_ADDR 0x0D
+#define BNO055_GYRO_DATA_X_LSB_ADDR  0x14
+#define BNO055_GYRO_DATA_X_MSB_ADDR  0x15
+#define BNO055_GYRO_DATA_Y_LSB_ADDR  0x16
+#define BNO055_GYRO_DATA_Y_MSB_ADDR  0x17
+#define BNO055_GYRO_DATA_Z_LSB_ADDR  0x18
+#define BNO055_GYRO_DATA_Z_MSB_ADDR  0x19
+#define BNO055_EULER_H_LSB_ADDR  0x1A
+#define BNO055_EULER_H_MSB_ADDR  0x1B
+#define BNO055_EULER_R_LSB_ADDR  0x1C
+#define BNO055_EULER_R_MSB_ADDR  0x1D
+#define BNO055_EULER_P_LSB_ADDR  0x1E
+#define BNO055_EULER_P_MSB_ADDR  0x1F
+#define BNO055_LINEAR_ACCEL_DATA_X_LSB_ADDR  0x28
+#define BNO055_LINEAR_ACCEL_DATA_X_MSB_ADDR  0x29
+#define BNO055_LINEAR_ACCEL_DATA_Y_LSB_ADDR  0x2A
+#define BNO055_LINEAR_ACCEL_DATA_Y_MSB_ADDR  0x2B
+#define BNO055_LINEAR_ACCEL_DATA_Z_LSB_ADDR  0x2C
+#define BNO055_LINEAR_ACCEL_DATA_Z_MSB_ADDR  0x2D
+
 // initialize global variables
 
 //---------------------------------------------------------------//
@@ -92,8 +123,36 @@ void UART_transmit_String( const uint8_t *MessageString){
 		MessageString++;
 	}
 }
+
+void Timer0_Init(void){
+	unsigned volatile delay;
+	SYSCTL_RCGCTIMER_R |= 0x01;				// activate timer 0
+	delay = SYSCTL_RCGCTIMER_R;
+	TIMER0_CTL_R = 0;									// disable the timer for setup
+	TIMER0_CFG_R = 0x04;							// configure for a 16-bit timer mode
+	TIMER0_TAMR_R |= 0x01;						// configure for a one shot, count down
+	TIMER0_CTL_R |= 0x01;							// enable timer0
+}
+
+void Timer0_DelayMs(uint16_t time){
+	uint16_t x;
+	unsigned long volatile delay;
+	SYSCTL_RCGCTIMER_R |= 1;	// enable Timer Block 0
+	delay =SYSCTL_RCGCTIMER_R;
+	for(x=0; x < time; x++){
+		TIMER0_TAILR_R = 16000 - 1;	// interval load value of every 1ms
+		TIMER0_ICR_R = 0x01;				// clear TimerA timeout flag
+		TIMER0_CTL_R = 0x01;			// enable timer A
+		while((TIMER0_RIS_R & 0x01) == 0) {
+			if((TIMER0_RIS_R & 0x01) == 0)
+				break;	// wait for timeout
+		}
+	}
+	TIMER0_ICR_R = 0x1;				// clear TimerA timeout flag	
+}
+
 	
-#define TPR (500/20 - 1)
+#define TPR (500/63 - 1)
 void I2C_Init(void){
 	SYSCTL_RCGCI2C_R |= 0x0001;					// activate I2C0
 	SYSCTL_RCGCGPIO_R |= 0x0002;				// activate port B
@@ -132,7 +191,7 @@ uint32_t I2C_Send2(uint8_t slave, uint8_t data1, uint8_t data2){
 
 #define MAXRETRIES 5                 // number of receive attempts before giving up
 
-uint16_t I2C_Recv2(uint8_t slave){
+uint8_t I2C_Recv(uint8_t slave){
 	uint8_t data1,data2;
 	int retryCounter = 1;
 	do{
@@ -144,15 +203,39 @@ uint16_t I2C_Recv2(uint8_t slave){
 									| I2C_MCS_RUN);     // master enable
 		while(I2C0_MCS_R & 0x00000001);   // wait for transmission done
 		data1=(I2C0_MDR_R&0xFF);					// MSB data sent first
-		I2C0_MCS_R=(I2C_MCS_STOP          // generate stop, no start
-								|I2C_MCS_RUN);  			// master enable
-		while(I2C0_MCS_R & 0x00000001);		// wait for transmission done
-		data2 = (I2C0_MDR_R&0xFF);				// LSB data sent last
-		retryCounter = retryCounter + 1;  // increment retry counter
 	}																		// repeat if error
 	while(((I2C0_MCS_R&(I2C_MCS_ADRACK|I2C_MCS_ERROR)) != 0)
 				 && (retryCounter <= MAXRETRIES));
 	return(data1<<8)+data2;             // usually returns 0xFFFF on error
+}
+
+void start_up_config(){
+	uint8_t addr = 0x3D;							// config Register
+	uint8_t data = 0x00;              // Config Mode
+	uint8_t len	= 1;									// data length 1
+	I2C_Send2(addr, data, len);				// write to the config register
+	Timer0_DelayMs(15);								// 15ms delay
+	
+	//Initialize power_on mode
+	addr = 0x3E;											// PowerMode Register
+	data = 0x00;											// Turn on IMU set Power Mode on
+	len = 1;													// length 1
+	I2C_Send2(addr, data, len);				// write to the pwer on register
+	Timer0_DelayMs(15);								// 15ms delay
+	
+	//Initialize External ClockSource
+	addr = 0x3F;											// OP_Mode
+	data = 0x80;											// external clockSource
+	len = 1;													// length 1
+	I2C_Send2(addr, data, len);				// write to the register
+	Timer0_DelayMs(17);								// 17ms delay
+	
+	// Configer
+	addr = 0x3D;											// Config Register
+	data = 0x0C;											// NDOF write mode
+	len = 1;													// data length 1
+	I2C_Send2(addr, data, len);				// write to the config Register
+	Timer0_DelayMs(19);								// 19ms delay
 }
 
 int main(void){
@@ -169,8 +252,19 @@ int main(void){
 	/*
 	Making sure the UART is connected correctly to the TM4C
 	*/
+	
+	start_up_config();
+	/*uint8_t id = I2C_Recv(BNO055_CHIP_ID_ADDR);
+	if( id != BNO055_ID){
+		Timer0_DelayMs(1);
+		id = I2C_Recv(BNO055_CHIP_ID_ADDR);
+		if(id != BNO055_ID){
+			UART_transmit_String("Hello\n\r");
+			while(1);
+		}
+	}*/
 	while(1){
-		x = I2C_Recv2(0x28);
+		//x = I2C_Recv2(0x28);
 		//UART_Tx(x);
 		for(delay=0; delay<1000000; delay++);
 		UART_transmit_String("Hello\n\r");
