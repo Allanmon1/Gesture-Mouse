@@ -41,6 +41,8 @@
 
 #include <stdint.h>
 #include "tm4c123gh6pm.h"
+#include "PLL.h"
+#include "bno055.h"
 #define GPIO_LOCK_KEY           0x4C4F434B  // Unlocks the GPIO_CR register
 #define PF0       (*((volatile uint32_t *)0x40025004))
 #define PF4       (*((volatile uint32_t *)0x40025040))
@@ -53,7 +55,7 @@
 #define RED       0x02
 #define BLUE      0x04
 #define GREEN     0x08
-
+/*
 #define BNO055_ID 0xA0
 #define BNO055_CHIP_ID_ADDR  0x00
 #define BNO055_ACCEL_REV_ID_ADDR  0x01
@@ -83,19 +85,22 @@
 #define BNO055_LINEAR_ACCEL_DATA_Y_MSB_ADDR  0x2B
 #define BNO055_LINEAR_ACCEL_DATA_Z_LSB_ADDR  0x2C
 #define BNO055_LINEAR_ACCEL_DATA_Z_MSB_ADDR  0x2D
-
+*/
 // initialize global variables
 
 //---------------------------------------------------------------//
 // Functions
 //---------------------------------------------------------------//
 
+//---------------------------------------------------------------//
+// UART Functions
+//---------------------------------------------------------------//
 void UART_Init(void){
 	SYSCTL_RCGCUART_R |= 0x0001; 			// activate UART0
 	SYSCTL_RCGCGPIO_R |= 0x0001;			// activate GPIOA
 	UART0_CTL_R &= ~0x0001;						// disable UART0
-	UART0_IBRD_R = 104;								// IBRD, 16MHz, 9600 baud rate
-	UART0_FBRD_R = 11;								// FBRD, (0.1667 * 64 + .05)
+	UART0_IBRD_R = 130;								// IBRD, 20MHz, 9600 baud rate, (20M/(16*9600))
+	UART0_FBRD_R = 13;								// FBRD, (0.2083 * 64 + .05)
 	UART0_LCRH_R = 0x0060;						// 8 bit (no parity, one stop, no FIFOs)
 	UART0_CTL_R |= 0x0001; 						// enable UART
 	GPIO_PORTA_AFSEL_R |= 0x03;				// enable alt funct on PA0,1
@@ -124,6 +129,9 @@ void UART_transmit_String( const uint8_t *MessageString){
 	}
 }
 
+//------------------------------------------------------------------//
+// Timer 0 Initilization
+//------------------------------------------------------------------//
 void Timer0_Init(void){
 	unsigned volatile delay;
 	SYSCTL_RCGCTIMER_R |= 0x01;				// activate timer 0
@@ -140,7 +148,7 @@ void Timer0_DelayMs(uint16_t time){
 	SYSCTL_RCGCTIMER_R |= 1;	// enable Timer Block 0
 	delay =SYSCTL_RCGCTIMER_R;
 	for(x=0; x < time; x++){
-		TIMER0_TAILR_R = 16000 - 1;	// interval load value of every 1ms
+		TIMER0_TAILR_R = 40000 - 1;	// interval load value of every 1ms
 		TIMER0_ICR_R = 0x01;				// clear TimerA timeout flag
 		TIMER0_CTL_R = 0x01;			// enable timer A
 		while((TIMER0_RIS_R & 0x01) == 0) {
@@ -151,110 +159,212 @@ void Timer0_DelayMs(uint16_t time){
 	TIMER0_ICR_R = 0x1;				// clear TimerA timeout flag	
 }
 
-	
-#define TPR (500/63 - 1)
+//--------------------------------------------------------//
+// I2C Initiliazation, send and receive
+//--------------------------------------------------------//
+// TPR = (Clock Frequency/(2*(scl_lp + scl_hp)*scl_clk)-1)
+// TPR = (clk_freq/(2*(6+4)scl_clk))-1
+//#define TPR (20000000/(2*10*100000))-1
 void I2C_Init(void){
 	SYSCTL_RCGCI2C_R |= 0x0001;					// activate I2C0
 	SYSCTL_RCGCGPIO_R |= 0x0002;				// activate port B
 	while((SYSCTL_PRGPIO_R&0x0002) == 0); // ready?
 	GPIO_PORTB_AFSEL_R |= 0x0C;					// enable alt function on PB2,3
-	GPIO_PORTB_ODR_R |= 0x0C; 					// enable open drain on PB2,3
+	GPIO_PORTB_DEN_R |= 0x0C;						// enable digital I/O on PB2,3
+	GPIO_PORTB_ODR_R |= 0x08; 					// enable open drain on PB3
 	GPIO_PORTB_PCTL_R &= ~0x0000FF00;		// clearing port control of PB2,3 to zero
 	GPIO_PORTB_PCTL_R |= 0x00003300;		// setting port control of PB2,3 for I2C
-	GPIO_PORTB_DEN_R |= 0x0C;						// enable digital I/O on PB2,3
+	GPIO_PORTB_CR_R |= 0x0C;
+	GPIO_PORTB_DIR_R |= 0x0C;						// PB2, 3 are set as outputs
 	I2C0_MCR_R = 0x00000010;						// master function enable
-	I2C0_MTPR_R = TPR;									// configure for 100kbps
+	I2C0_MTPR_R = 0x9;									// configure for 100kbps
 }
 
-uint32_t I2C_Send2(uint8_t slave, uint8_t data1, uint8_t data2){
-	while(I2C0_MCS_R & 0x00000001);     // wait for I2C ready
-	I2C0_MSA_R = (slave<<1)&0xFE;       // MSA[7:1] is slave address
-	I2C0_MSA_R &= ~0x01;								// MSA[0] IS 0 for send
-	I2C0_MDR_R = data1&0xFF;            // prepare first byte
-	I2C0_MCS_R = (I2C_MCS_START					// generate start/restart
-								| I2C_MCS_RUN);				// no ack, no stop, master enable
-	while(I2C0_MCS_R & 0x00000001);			// wait for ftransmission done
+void setSlaveAddress(uint8_t slaveaddr){
+	I2C0_MSA_R =(slaveaddr<<1)&0xFE;      //shifting the address for adding the R/W bit
+}
+
+void I2C_Send2( uint8_t regaddr, uint8_t data1){
+	I2C0_MSA_R &= ~0x01;											// MSA[0] IS 0 for send
+	I2C0_MDR_R = regaddr&0xFF;          		  // prepare first byte
+	I2C0_MCS_R = (I2C_MCS_START								// generate start/restart
+								| I2C_MCS_RUN);							// no ack, no stop, master enable, run start
+	while((I2C0_MCS_R & 0x00000001)!= 0);			// wait for ftransmission done
 		// chech error bits
-	if((I2C0_MCS_R&
-		 (I2C_MCS_DATACK|I2C_MCS_ADRACK|I2C_MCS_ERROR)) != 0){
-			 I2C0_MCS_R = I2C_MCS_STOP;     // stop, no ack, disable
-			 return (I2C0_MCS_R&             // return error bits if nonzero
-				       (I2C_MCS_DATACK|I2C_MCS_ADRACK|I2C_MCS_ERROR));
+	if((I2C0_MCS_R&0x00000002) != 0){
+		if((I2C0_MCS_R & 0x00000010) == 1){
+		}
+		else {
+			 I2C0_MCS_R = I2C_MCS_STOP;     				// stop, no ack, disable
+			 while((I2C0_MCS_R & 0x00000001) != 0); // return error bits if nonzero
+				       
 		 }
-	I2C0_MDR_R = data2&0xFF;						// prepare second byte
-	I2C0_MCS_R = (I2C_MCS_STOP					// no ack, stop, no start
-								 | I2C_MCS_RUN);			// master enable
-	while(I2C0_MCS_R & 0x00000001);			// wait for transmission done
-	return (I2C0_MCS_R&									// return error bits
-					(I2C_MCS_DATACK|I2C_MCS_ADRACK|I2C_MCS_ERROR));
+	}
+	I2C0_MDR_R = data1&0xFF;										// prepare second byte
+	I2C0_MCS_R = (I2C_MCS_STOP									// no ack, stop, no start
+								 | I2C_MCS_RUN);							// master enable
+	while(I2C0_MCS_R & 0x00000001);							// wait for transmission done
+	// chech error bits
+	if((I2C0_MCS_R&0x00000002) != 0){
+		if((I2C0_MCS_R & 0x00000010) == 1){
+		}
+		else {
+			 I2C0_MCS_R = I2C_MCS_STOP;     				// stop, no ack, disable
+			 while((I2C0_MCS_R & 0x00000001) != 0); // return error bits if nonzero
+				       
+		 }
+	}
+}
+
+void ReadRegister(uint8_t reg_addr){
+	I2C0_MSA_R &= ~0x01;											// MSA[0] IS 0 for send
+	I2C0_MDR_R = reg_addr&0xFF;          		  // prepare first byte
+	I2C0_MCS_R = (I2C_MCS_START								// generate start/restart
+								| I2C_MCS_RUN);							// no ack, no stop, master enable, run start
+	while((I2C0_MCS_R & 0x00000001)!= 0);			// wait for ftransmission done
+		// chech error bits
+	if((I2C0_MCS_R&0x00000002) != 0){
+		if((I2C0_MCS_R & 0x00000010) == 1){
+		}
+		else {
+			 I2C0_MCS_R = I2C_MCS_STOP;     				// stop, no ack, disable
+			 while((I2C0_MCS_R & 0x00000001) != 0); // return error bits if nonzero
+				       
+		 }
+	}
 }
 
 #define MAXRETRIES 5                 // number of receive attempts before giving up
-
-uint8_t I2C_Recv(uint8_t slave){
-	uint8_t data1,data2;
+uint8_t I2C_Recv(void){
+	uint8_t data1;
 	int retryCounter = 1;
 	do{
-		while(I2C0_MCS_R&0x00000001);     // wait for I2C ready
-		I2C0_MSA_R = (slave << 1) & 0xFE; // MSA[7:1] is slave address
 		I2C0_MSA_R |= 0x01;								// MSA[0] is 1 for receive
 		I2C0_MCS_R = (I2C_MCS_ACK					// positive data ack
 									| I2C_MCS_START     // no stop, yes start/restart
 									| I2C_MCS_RUN);     // master enable
 		while(I2C0_MCS_R & 0x00000001);   // wait for transmission done
+		
 		data1=(I2C0_MDR_R&0xFF);					// MSB data sent first
 	}																		// repeat if error
 	while(((I2C0_MCS_R&(I2C_MCS_ADRACK|I2C_MCS_ERROR)) != 0)
 				 && (retryCounter <= MAXRETRIES));
-	return(data1<<8)+data2;             // usually returns 0xFFFF on error
+	return data1;             			// usually returns 0xFFFF on error
 }
 
+
+//--------------------------------------------------------------//
+// Configure Function of BNO055
+//--------------------------------------------------------------//
 void start_up_config(){
-	uint8_t addr = 0x3D;							// config Register
-	uint8_t data = 0x00;              // Config Mode
-	uint8_t len	= 1;									// data length 1
-	I2C_Send2(addr, data, len);				// write to the config register
-	Timer0_DelayMs(15);								// 15ms delay
+	uint8_t addr;
+	uint8_t data;
+	/*
+	addr = 0x3D;							// config Register
+	data = 0x00;              // Config Mode
+	I2C_Send2( addr,data);				// write to the config register
+	Timer0_DelayMs(2000);								// 15ms delay
+	*/
+	
+	/*
+	//Initialize External ClockSource
+	addr = 0x3F;											// OP_Mode
+	data = 0x80;											// external clockSource
+	I2C_Send2(addr, data);				// write to the register
+	Timer0_DelayMs(2000);								// 17ms delay
+	*/
+	
+	// Page 1 
+	addr = 0x07;
+	data = 0x01;
+	I2C_Send2(addr, data);
+	Timer0_DelayMs(2000);
+	
+	
+	
+	// Gyro Configuration (gyr config 0)
+	addr = 0x0A;											// Gyro Config
+	data = 0x01;											// Non-Fusion Mode Gyro Only
+	I2C_Send2(addr, data);				// write to the config Register
+	Timer0_DelayMs(2000);								// 19ms delay
+	
+	// Gyro Configuration (gyr config 1)
+	addr = 0x0B;											// Gyro Config
+	data = 0x00;											// Non-Fusion Mode Gyro Only
+	I2C_Send2(addr, data);				// write to the config Register
+	Timer0_DelayMs(2000);								// 19ms delay
+	
+	// Page 0 
+	addr = 0x07;								
+	data = 0x00;
+	I2C_Send2(addr, data);
+	Timer0_DelayMs(2000);
 	
 	//Initialize power_on mode
 	addr = 0x3E;											// PowerMode Register
 	data = 0x00;											// Turn on IMU set Power Mode on
-	len = 1;													// length 1
-	I2C_Send2(addr, data, len);				// write to the pwer on register
-	Timer0_DelayMs(15);								// 15ms delay
+	I2C_Send2(addr,data);				// write to the pwer on register
+	Timer0_DelayMs(2000);								// 15ms delay
 	
-	//Initialize External ClockSource
-	addr = 0x3F;											// OP_Mode
-	data = 0x80;											// external clockSource
-	len = 1;													// length 1
-	I2C_Send2(addr, data, len);				// write to the register
-	Timer0_DelayMs(17);								// 17ms delay
+	// unit Select
+	addr = 0x3B;
+	data = 0x02;
+	I2C_Send2(addr,data);				// write to the config register
+	Timer0_DelayMs(2000);								// 15ms delay
 	
-	// Configer
-	addr = 0x3D;											// Config Register
-	data = 0x0C;											// NDOF write mode
-	len = 1;													// data length 1
-	I2C_Send2(addr, data, len);				// write to the config Register
-	Timer0_DelayMs(19);								// 19ms delay
+	// Config Register
+	addr = 0x3D;							// config Register
+	data = 0x08;              //  Set for Accel, Mag, and Gyro on
+	I2C_Send2(addr,data);				// write to the config register
+	Timer0_DelayMs(2000);								// 15ms delay
 }
 
+//------------------------------------------------------------------//
+// Main Function
+//------------------------------------------------------------------//
+/*
 int main(void){
-	uint16_t x;
-	uint32_t delay;
+	PLL_Init();
 	UART_Init();
-	/* 
-		After initialization of UART, a delay is required before transmitting any data.
-		Not including a delay will cause the TM4C to transmit incorrect data.
-	*/
+	I2C_Init();
+	bno055_init(&bno055);
+	
+	while(1);
+}
+*/
+int main(void){
+	uint16_t x = 0x10;
+	uint16_t y;
+	uint32_t delay;
+	PLL_Init();
+	UART_Init();
+	
 	I2C_Init();
 	for(delay=0; delay<1000000; delay++);
-	UART_transmit_String("Hello\n\r");
-	/*
-	Making sure the UART is connected correctly to the TM4C
-	*/
+	//UART_transmit_String("Hello\n\r");
 	
+	setSlaveAddress(0x28);
 	start_up_config();
-	/*uint8_t id = I2C_Recv(BNO055_CHIP_ID_ADDR);
+	Timer0_DelayMs(20000);
+	while(1){
+		
+		ReadRegister(0x15);
+		for(delay	=0; delay<1000000; delay++);
+		x = I2C_Recv();
+		for(delay	=0; delay<1000000; delay++);
+		/*ReadRegister(0x15);
+		for(delay	=0; delay<1000000; delay++);
+		y = I2C_Recv();
+		for(delay	=0; delay<1000000; delay++);*/
+		UART_Tx(x);
+		for(delay	=0; delay<1000000; delay++);
+		UART_Tx(y);
+		for(delay	=0; delay<1000000; delay++);
+	}
+}
+
+
+/*uint8_t id = I2C_Recv(BNO055_CHIP_ID_ADDR);
 	if( id != BNO055_ID){
 		Timer0_DelayMs(1);
 		id = I2C_Recv(BNO055_CHIP_ID_ADDR);
@@ -263,11 +373,3 @@ int main(void){
 			while(1);
 		}
 	}*/
-	while(1){
-		//x = I2C_Recv2(0x28);
-		//UART_Tx(x);
-		for(delay=0; delay<1000000; delay++);
-		UART_transmit_String("Hello\n\r");
-	}
-}
-
